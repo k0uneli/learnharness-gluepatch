@@ -4,7 +4,10 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Loader2Icon, MicIcon } from "lucide-react";
 import { useSettingsDialog } from "@/components/settings/settings-dialog";
 import { Hint } from "@/components/ui/hint";
-import { deepgramListenUrl, type DictationLanguage } from "@/src/core";
+import {
+	deepgramListenUrl, pcm16ToWav, tidyWhisperText, whisperStreamUrl,
+	type DictationLanguage, type EffectiveDictation,
+} from "@/src/core";
 import { useDictationLanguage } from "@/components/dictation-preference";
 import { setDictationActive } from "@/components/dictation-state";
 export { isDictationActive } from "@/components/dictation-state";
@@ -83,6 +86,20 @@ export { isDictationActive } from "@/components/dictation-state";
  *     path, which always mints FRESH.
  *   - The honest floor stays: getUserMedia can't be pre-warmed (the mic
  *     indicator would stay lit) — hence the owner's optimistic meter.
+ *
+ * Self-hosted Whisper engine (Settings → Providers → Dictation → Engine):
+ * the same capture graph, meter, deferred buffer and generation guard; no
+ * token. Two transports:
+ *   - upload: frames accumulate locally for the whole run; Stop POSTs one
+ *     WAV through the app server's relay (/api/stt/whisper — speaches
+ *     omits CORS headers for LAN hosts) and the response text flushes like
+ *     a Deepgram run (spinner while it transcribes; Esc aborts and
+ *     discards). The relay reads the server URL/model from settings.
+ *   - stream: frames go over the server's WebSocket; every message is the
+ *     WHOLE transcript so far, so the latest one replaces the last. Stop
+ *     kills the mic and waits for the server's own close (it closes ~2s
+ *     after audio stops); a 10s safety net commits what arrived. A dropped
+ *     connection keeps its text and reconnects once, appending after it.
  */
 
 /*
@@ -109,6 +126,10 @@ export const DEEPGRAM_KEY_ID = "DEEPGRAM_API_KEY";
  * instead. Exported for pins; the errored idle button's click recognizes
  * it and deep-links Settings → Keys → the Deepgram row. */
 export const DICTATION_KEYLESS = "Dictation needs a Deepgram key";
+
+/** Stream mode: how long Stop waits for the Whisper server to flush and
+ *  close before committing the text received so far. */
+export const WHISPER_STREAM_STOP_TIMEOUT_MS = 10_000;
 
 /** Mint a fresh short-lived token (the route holds the real key
  *  server-side). Module-level: the start path's warm cache and the
@@ -282,7 +303,7 @@ export type Dictation = {
  * question waits.
  */
 export function useDictation({ append }: { append: (text: string) => void }): Dictation {
-	const { getLanguage } = useDictationLanguage();
+	const { getSettings } = useDictationLanguage();
 	const [phase, setPhase] = useState<DictationPhase>("idle");
 	const [error, setError] = useState<string | null>(null);
 	/** Latest RMS from the worklet — the meter samples this (dictate pattern). */
@@ -320,6 +341,17 @@ export function useDictation({ append }: { append: (text: string) => void }): Di
 	/** Resolvers waiting for the run to fully end (finish(), owner
 	 *  2026-10-01): released by cleanup() — every terminal path runs it. */
 	const waitersRef = useRef<Array<() => void>>([]);
+	/** The current run's settings (engine + Whisper config), fixed at start. */
+	const runRef = useRef<EffectiveDictation | null>(null);
+	/** Whisper upload: every frame of the run, sent as one WAV at Stop. */
+	const recordRef = useRef<Int16Array[]>([]);
+	/** Whisper stream: the current socket's latest whole-transcript text,
+	 *  committed into the buffer when that socket ends (or at cleanup). */
+	const streamTextRef = useRef("");
+	/** Whisper: Stop was pressed — a socket close now means "done". */
+	const stoppingRef = useRef(false);
+	/** Whisper upload: the in-flight request, aborted by cancel/cleanup. */
+	const uploadRef = useRef<AbortController | null>(null);
 
 	/** Flush the buffered transcript into the primary input — question claim
 	 *  first, composer fallback. Called exactly once per run, at cleanup; the
@@ -331,11 +363,29 @@ export function useDictation({ append }: { append: (text: string) => void }): Di
 		(questionTarget ?? appendRef.current)(text);
 	}, []);
 
+	/** Whisper stream: move the current socket's text into the buffer. */
+	const commitStreamText = useCallback(() => {
+		if (streamTextRef.current) bufferRef.current.push(streamTextRef.current);
+		streamTextRef.current = "";
+	}, []);
+
+	/** Drop everything the run captured (cancel / navigation). */
+	const discard = useCallback(() => {
+		bufferRef.current = [];
+		streamTextRef.current = "";
+		recordRef.current = [];
+	}, []);
+
 	/** Full teardown of one run's machinery. Idempotent; generation-guarded by callers. */
 	const cleanup = useCallback((warmNext = true) => {
 		genRef.current++;
 		setDictationActive(false);
+		commitStreamText(); // Whisper stream: whatever arrived is the transcript
 		flush(); // the deferred transcript appears when the run ends (owner round 2)
+		recordRef.current = [];
+		stoppingRef.current = false;
+		uploadRef.current?.abort();
+		uploadRef.current = null;
 		if (safetyRef.current) {
 			clearTimeout(safetyRef.current);
 			safetyRef.current = null;
@@ -361,9 +411,11 @@ export function useDictation({ append }: { append: (text: string) => void }): Di
 		// target field with the dictated tail already in it.
 		for (const w of waitersRef.current.splice(0)) w();
 		// Pre-mint for the next run (mitigation D) — best-effort; a keyless
-		// page just doesn't warm.
-		if (warmNext) warmTokens.refresh();
-	}, []);
+		// page just doesn't warm. Whisper needs no token.
+		const engine = runRef.current?.engine ?? "deepgram";
+		runRef.current = null;
+		if (warmNext && engine === "deepgram") warmTokens.refresh();
+	}, [commitStreamText]);
 
 	/** Open the Deepgram socket and wire its messages. `gen` guards staleness. */
 	const openSocket = useCallback(
@@ -430,6 +482,88 @@ export function useDictation({ append }: { append: (text: string) => void }): Di
 		[cleanup],
 	);
 
+	/** Open the Whisper streaming socket. Each message is the whole
+	 *  transcript so far for THIS socket; `gen` guards staleness. */
+	const openWhisperSocket = useCallback(
+		(gen: number, run: EffectiveDictation) => {
+			const ws = new WebSocket(whisperStreamUrl(run.whisper.url, run.whisper.model, run.language));
+			ws.binaryType = "arraybuffer";
+			wsRef.current = ws;
+			let opened = false;
+
+			ws.addEventListener("open", () => {
+				if (gen !== genRef.current) return;
+				opened = true;
+				for (const frame of pendingRef.current) ws.send(frame);
+				pendingRef.current = [];
+				setPhase((p) => (p === "connecting" ? "recording" : p));
+			});
+			ws.addEventListener("message", (ev) => {
+				if (gen !== genRef.current) return;
+				let msg: { text?: unknown };
+				try {
+					msg = JSON.parse(ev.data as string);
+				} catch {
+					return;
+				}
+				if (typeof msg.text === "string") streamTextRef.current = tidyWhisperText(msg.text);
+			});
+			ws.addEventListener("close", (ev) => {
+				if (gen !== genRef.current) return;
+				// Stopped: the server flushed its last text and closed — done.
+				if (stoppingRef.current) {
+					cleanup();
+					return;
+				}
+				// Mid-run drop: keep this socket's text, reconnect ONCE and
+				// append whatever the new socket transcribes after it.
+				commitStreamText();
+				if (reconnectsRef.current < 1) {
+					reconnectsRef.current++;
+					openWhisperSocket(gen, run);
+				} else {
+					setError(opened ? `Whisper connection lost (${ev.code})` : `Whisper server unreachable (${run.whisper.url})`);
+					cleanup();
+				}
+			});
+		},
+		[cleanup, commitStreamText],
+	);
+
+	/** Upload the recorded run as one WAV via the app server's relay; the
+	 *  text flushes at cleanup. */
+	const uploadRecording = useCallback(
+		async (gen: number, frames: Int16Array[]) => {
+			const controller = new AbortController();
+			uploadRef.current = controller;
+			const form = new FormData();
+			form.append("file", new Blob([pcm16ToWav(frames)], { type: "audio/wav" }), "dictation.wav");
+			try {
+				let res: Response;
+				try {
+					res = await fetch("/api/stt/whisper", { method: "POST", body: form, signal: controller.signal });
+				} catch {
+					if (gen !== genRef.current) return;
+					throw new Error("Whisper upload failed");
+				}
+				const data = (await res.json().catch(() => ({}))) as { text?: unknown; message?: unknown };
+				if (gen !== genRef.current) return;
+				if (!res.ok || typeof data.text !== "string") {
+					throw new Error(typeof data.message === "string" ? data.message : `Whisper relay ${res.status}`);
+				}
+				if (data.text) bufferRef.current.push(data.text);
+				cleanup();
+			} catch (e) {
+				if (gen !== genRef.current) return;
+				setError(e instanceof Error ? e.message : "Whisper transcription failed");
+				cleanup();
+			} finally {
+				if (uploadRef.current === controller) uploadRef.current = null;
+			}
+		},
+		[cleanup],
+	);
+
 	const start = useCallback(async () => {
 		setDictationActive(true);
 		setError(null);
@@ -437,10 +571,13 @@ export function useDictation({ append }: { append: (text: string) => void }): Di
 		reconnectsRef.current = 0;
 		bufferRef.current = []; // fresh run, fresh buffer (round 2)
 		pendingRef.current = []; // fresh run, fresh queue (mitigation A)
+		recordRef.current = [];
+		streamTextRef.current = "";
+		stoppingRef.current = false;
 		const gen = ++genRef.current;
-		let language: DictationLanguage;
+		let run: EffectiveDictation;
 		try {
-			language = await getLanguage();
+			run = await getSettings();
 		} catch (e) {
 			if (gen !== genRef.current) return;
 			setError(e instanceof Error ? e.message : "Dictation language unavailable");
@@ -448,6 +585,9 @@ export function useDictation({ append }: { append: (text: string) => void }): Di
 			return;
 		}
 		if (gen !== genRef.current) return;
+		runRef.current = run;
+		const { language, engine } = run;
+		const uploading = engine === "whisper" && run.whisper.mode === "upload";
 
 		// Mitigation D: the warm token (pre-minted at mount / after the last
 		// run) resolves ~instantly; a cold/keyless mint surfaces below. The
@@ -455,7 +595,8 @@ export function useDictation({ append }: { append: (text: string) => void }): Di
 		// the token runs concurrently with it. 127.0.0.1 is a secure
 		// context, so getUserMedia works without TLS; macOS TCC prompts on
 		// first use.
-		const tokenPromise = warmTokens.mint();
+		// Whisper needs no token — the window talks to the server directly.
+		const tokenPromise = engine === "deepgram" ? warmTokens.mint() : Promise.resolve("");
 		tokenPromise.catch(() => {}); // surfaced below; no unhandled rejection
 		const micPromise = navigator.mediaDevices.getUserMedia({
 			audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
@@ -483,6 +624,11 @@ export function useDictation({ append }: { append: (text: string) => void }): Di
 				if (msg.type === "level") {
 					levelRef.current = msg.rms ?? 0; // never reset to zero (dictate pattern)
 				} else if (msg.type === "audio") {
+					// Whisper upload: the whole run is kept for the one POST.
+					if (uploading) {
+						recordRef.current.push(msg.buffer as unknown as Int16Array);
+						return;
+					}
 					const ws = wsRef.current;
 					if (ws && ws.readyState === WebSocket.OPEN) ws.send(msg.buffer!);
 					// Mitigation A: not OPEN yet (handshake or reconnect gap) —
@@ -522,10 +668,16 @@ export function useDictation({ append }: { append: (text: string) => void }): Di
 			return;
 		}
 		if (gen !== genRef.current) return;
+		if (engine === "whisper") {
+			// Upload: nothing to connect — the run is "recording" from here.
+			if (uploading) setPhase("recording");
+			else openWhisperSocket(gen, run);
+			return;
+		}
 		// Mitigation B: the handshake fires the moment the graph is live,
 		// overlapping any remaining token wait — mic-gated, never before it.
 		openSocket(gen, token, language);
-	}, [openSocket, cleanup, getLanguage]);
+	}, [openSocket, openWhisperSocket, cleanup, getSettings]);
 
 	const stop = useCallback(() => {
 		const gen = genRef.current;
@@ -540,6 +692,29 @@ export function useDictation({ append }: { append: (text: string) => void }): Di
 		sourceRef.current = null;
 		workletRef.current?.disconnect();
 		workletRef.current = null;
+
+		const run = runRef.current;
+		if (run?.engine === "whisper") {
+			stoppingRef.current = true;
+			if (run.whisper.mode === "upload") {
+				const frames = recordRef.current;
+				recordRef.current = [];
+				if (frames.length === 0) cleanup();
+				else void uploadRecording(gen, frames);
+				return;
+			}
+			// Stream: no more audio goes out; the server flushes its last
+			// text and closes on its own. The safety net commits what came.
+			const ws = wsRef.current;
+			if (ws && ws.readyState === WebSocket.OPEN) {
+				safetyRef.current = setTimeout(() => {
+					if (gen === genRef.current) cleanup();
+				}, WHISPER_STREAM_STOP_TIMEOUT_MS);
+			} else {
+				cleanup();
+			}
+			return;
+		}
 
 		const ws = wsRef.current;
 		if (ws && ws.readyState === WebSocket.OPEN) {
@@ -557,16 +732,17 @@ export function useDictation({ append }: { append: (text: string) => void }): Di
 		} else {
 			cleanup();
 		}
-	}, [phase, cleanup]);
+	}, [phase, cleanup, uploadRecording]);
 
 	const cancel = useCallback(() => {
 		if (phase === "idle") return;
 		// Discard first, teardown second — cleanup() flushes, and the now-empty
 		// buffer makes that flush a no-op. Also kills a "stopping" run: the
-		// flush already underway is abandoned (its timer is cleared inside).
-		bufferRef.current = [];
+		// flush already underway is abandoned (its timer is cleared inside;
+		// a Whisper upload in flight is aborted there too).
+		discard();
 		cleanup();
-	}, [phase, cleanup]);
+	}, [phase, cleanup, discard]);
 
 	const finish = useCallback((): Promise<void> => {
 		return new Promise((resolve) => {
@@ -604,10 +780,10 @@ export function useDictation({ append }: { append: (text: string) => void }): Di
 		return () => {
 			// Navigation cancels capture: invalidate every pending await before
 			// releasing resources, and never append into a different page's input.
-			bufferRef.current = [];
+			discard();
 			cleanup(false);
 		};
-	}, [cleanup]);
+	}, [cleanup, discard]);
 	useEffect(() => {
 		window.addEventListener("lh:kbd-toggle-dictation", toggle);
 		return () => window.removeEventListener("lh:kbd-toggle-dictation", toggle);

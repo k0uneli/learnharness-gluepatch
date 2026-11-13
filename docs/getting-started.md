@@ -33,6 +33,15 @@ Sessions are saved locally, including earlier messages when context is compacted
 
 Audio streams from your browser directly to Deepgram using a short-lived token. A `403 Insufficient permissions` error while obtaining that token can mean the key's role is insufficient.
 
+### Self-hosted Whisper
+
+Set **Engine** to **Whisper (self-hosted)** in the same group to use your own OpenAI-compatible Whisper server, such as [speaches](https://github.com/speaches-ai/speaches) (formerly faster-whisper-server).
+
+1. Enter the server URL, for example `http://192.168.1.10:8000`, and a model the server can load, for example `Systran/faster-whisper-large-v3`.
+2. Choose a **Mode**. **Upload on stop** sends the whole recording when you stop dictating. **Live stream** transcribes over a WebSocket while you speak.
+
+The Language setting applies to both engines. For Whisper, regional variants use the base language, and **Multilingual** lets Whisper detect the language. Recordings go only to the configured server. In upload mode the app's local server forwards them, and in stream mode the app window connects directly, so the server needs no cross-origin configuration.
+
 ## Use local files in a session
 
 In the desktop app, use the paperclip's **Files** or **Folder** choice, or drag files/folders into the content area, to insert their local paths. Files supports any file type and multiple selections; Folder attaches one directory path, including an empty folder, without expanding or reading its contents. Newly picked or dropped known folders get a trailing directory separator so their Folder icon survives saved messages and reloads; files stay unchanged. Older unmarked paths are not retrospectively classified. The agent can then locate/read supported content on the machine running LearnHarness under the existing file-access guards; attaching a path does not grant permissions. This is **not an upload**: originals stay where they are. Ordinary browsers cannot expose these local paths through the picker or drag-and-drop; you can paste a full path instead.

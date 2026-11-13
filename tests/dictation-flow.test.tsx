@@ -26,6 +26,8 @@ class Socket extends EventTarget {
 	close() { this.readyState = 3; }
 	open() { this.readyState = Socket.OPEN; this.dispatchEvent(new Event("open")); }
 	end(code = 1000) { this.close(); this.dispatchEvent(Object.assign(new Event("close"), { code })); }
+	/** A Whisper stream message: the whole transcript so far. */
+	text(text: string) { this.dispatchEvent(Object.assign(new Event("message"), { data: JSON.stringify({ text }) })); }
 	final(text: string) {
 		this.dispatchEvent(Object.assign(new Event("message"), {
 			data: JSON.stringify({ type: "Results", is_final: true, channel: { alternatives: [{ transcript: text }] } }),
@@ -39,7 +41,15 @@ class AudioGraph {
 	audioWorklet = { addModule: async () => {} };
 	createMediaStreamSource() { return { connect() {}, disconnect() {} }; }
 }
-class Worklet { port = {}; connect() {} disconnect() {} }
+class Worklet {
+	static last: Worklet | undefined;
+	port: { onmessage?: (e: { data: unknown }) => void } = {};
+	constructor() { Worklet.last = this; }
+	connect() {}
+	disconnect() {}
+	/** Feed one captured frame, as the pcm-capture worklet would. */
+	static frame(samples: number[]) { Worklet.last!.port.onmessage!({ data: { type: "audio", buffer: new Int16Array(samples) } }); }
+}
 
 const globals = globalThis as Record<string, unknown>;
 let restore: (() => void) | undefined;
@@ -58,6 +68,10 @@ async function fixture(language: "pl" | "en" = "pl", delayedRead?: Promise<Respo
 		captures: 0,
 		stops: 0,
 		appends: [] as string[],
+		mints: 0,
+		uploads: [] as { url: string; body: FormData; signal: AbortSignal }[],
+		/** The Whisper relay's next reply (a deferred lets a test hold it). */
+		nextUpload: undefined as Promise<Response> | undefined,
 	};
 	Socket.all = [];
 	const previous = new Map<string, PropertyDescriptor | undefined>();
@@ -71,7 +85,13 @@ async function fixture(language: "pl" | "en" = "pl", delayedRead?: Promise<Respo
 		WebSocket: Socket, AudioContext: AudioGraph, AudioWorkletNode: Worklet,
 		IS_REACT_ACT_ENVIRONMENT: true,
 		fetch: async (url: string, init?: RequestInit) => {
-			if (url === "/api/stt/token") return Response.json({ token: "test-token" });
+			if (url === "/api/stt/token") { state.mints++; return Response.json({ token: "test-token" }); }
+			if (url === "/api/stt/whisper") {
+				state.uploads.push({ url, body: init!.body as FormData, signal: init!.signal! });
+				const reply = state.nextUpload ?? Promise.resolve(Response.json({ text: "Hello world." }));
+				state.nextUpload = undefined;
+				return reply;
+			}
 			if (url === "/api/settings") {
 				state.reads++;
 				if (state.nextRead) { const response = state.nextRead; state.nextRead = undefined; return response; }
@@ -319,4 +339,154 @@ test("microphone permission resolving after unmount immediately stops the late s
 	assert.equal(f.state.stops, 1);
 	assert.equal(Socket.all.length, 0);
 	assert.equal(isDictationActive(), false);
+});
+
+/* ── Self-hosted Whisper engine ── */
+
+async function whisperFixture(mode: "upload" | "stream", language: "en-GB" | "multi" = "en-GB") {
+	const f = await fixture();
+	f.state.record = {
+		version: 1,
+		dictation: { language, engine: "whisper", whisper: { url: "http://whisper.test:8000", model: "Systran/faster-whisper-large-v3", mode } },
+	};
+	await f.mount();
+	return f;
+}
+
+test("whisper upload: no token or socket; Stop posts one WAV to the app's relay and the text flushes once", async () => {
+	const f = await whisperFixture("upload");
+	const mintsAtMount = f.state.mints;
+	const reply = deferred<Response>();
+	f.state.nextUpload = reply.promise;
+	await act(async () => { f.dictation.toggle(); });
+	assert.equal(f.dictation.phase, "recording", "nothing to connect: recording once the mic is live");
+	await act(async () => { Worklet.frame([1, 2]); Worklet.frame([3]); });
+	await act(async () => { f.dictation.stop(); });
+	assert.equal(f.dictation.phase, "stopping", "spinner while the server transcribes");
+	assert.equal(f.state.stops, 1, "the mic dies at Stop");
+	assert.equal(f.state.uploads.length, 1);
+	const { url, body } = f.state.uploads[0]!;
+	assert.equal(url, "/api/stt/whisper", "relayed: speaches omits CORS headers for LAN hosts");
+	assert.deepEqual([...body.keys()], ["file"], "the relay takes url/model/language from saved settings");
+	const wav = new DataView(await (body.get("file") as Blob).arrayBuffer());
+	assert.equal(wav.byteLength, 44 + 6);
+	assert.deepEqual([0, 1, 2].map((i) => wav.getInt16(44 + i * 2, true)), [1, 2, 3]);
+	assert.deepEqual(f.state.appends, []);
+	await act(async () => { reply.resolve(Response.json({ text: "Hello world." })); });
+	assert.deepEqual(f.state.appends, ["Hello world."]);
+	assert.equal(f.dictation.phase, "idle");
+	assert.equal(f.state.active, false);
+	assert.equal(Socket.all.length, 0);
+	assert.equal(f.state.mints, mintsAtMount, "Whisper never mints a Deepgram token");
+});
+
+test("whisper upload: finish() resolves after the text lands", async () => {
+	const f = await whisperFixture("upload");
+	await act(async () => { f.dictation.toggle(); });
+	await act(async () => { Worklet.frame([7]); });
+	let finished = false;
+	await act(async () => { await f.dictation.finish().then(() => { finished = true; }); });
+	assert.equal(finished, true);
+	assert.deepEqual(f.state.appends, ["Hello world."]);
+});
+
+test("whisper upload: the relay's failure message surfaces on the button; nothing reaches the input", async () => {
+	const f = await whisperFixture("upload");
+	f.state.nextUpload = Promise.resolve(Response.json({ message: "Whisper transcription failed (500): model not found" }, { status: 502 }));
+	await act(async () => { f.dictation.toggle(); });
+	await act(async () => { Worklet.frame([1]); });
+	await act(async () => { f.dictation.stop(); });
+	assert.equal(f.dictation.error, "Whisper transcription failed (500): model not found");
+	assert.equal(f.dictation.phase, "idle");
+	const unreachable = Promise.reject(new TypeError("fetch failed"));
+	unreachable.catch(() => {}); // the hook awaits it later
+	f.state.nextUpload = unreachable;
+	await act(async () => { f.dictation.toggle(); });
+	assert.equal(f.dictation.error, null, "the next run clears the error");
+	await act(async () => { Worklet.frame([1]); });
+	await act(async () => { f.dictation.stop(); });
+	assert.equal(f.dictation.error, "Whisper upload failed");
+	assert.deepEqual(f.state.appends, []);
+});
+
+test("whisper upload: Esc while transcribing aborts the request and discards a late reply", async () => {
+	const f = await whisperFixture("upload");
+	const reply = deferred<Response>();
+	f.state.nextUpload = reply.promise;
+	await act(async () => { f.dictation.toggle(); });
+	await act(async () => { Worklet.frame([1]); });
+	await act(async () => { f.dictation.stop(); });
+	await act(async () => { f.dictation.cancel(); });
+	assert.equal(f.state.uploads[0]!.signal.aborted, true);
+	assert.equal(f.dictation.phase, "idle");
+	await act(async () => { reply.resolve(Response.json({ text: "too late" })); });
+	assert.deepEqual(f.state.appends, []);
+	assert.equal(f.dictation.error, null);
+});
+
+test("whisper upload: stopping before any audio uploads nothing", async () => {
+	const f = await whisperFixture("upload");
+	await act(async () => { f.dictation.toggle(); });
+	await act(async () => { f.dictation.stop(); });
+	assert.equal(f.state.uploads.length, 0);
+	assert.equal(f.dictation.phase, "idle");
+	assert.deepEqual(f.state.appends, []);
+});
+
+test("whisper stream: queued frames flush on open, the latest whole transcript wins, Stop waits for the server's close", async () => {
+	const f = await whisperFixture("stream");
+	await act(async () => { f.dictation.toggle(); });
+	const socket = Socket.all[0]!;
+	const url = new URL(socket.url);
+	assert.equal(url.origin + url.pathname, "ws://whisper.test:8000/v1/audio/transcriptions");
+	assert.deepEqual(Object.fromEntries(url.searchParams), { model: "Systran/faster-whisper-large-v3", language: "en", response_format: "json" });
+	assert.deepEqual(socket.protocols, undefined, "no auth subprotocol");
+	await act(async () => { Worklet.frame([1]); });
+	assert.equal(socket.sent.length, 0, "queued until open");
+	await act(async () => { socket.open(); });
+	assert.equal(f.dictation.phase, "recording");
+	assert.equal(socket.sent.length, 1);
+	await act(async () => { Worklet.frame([2]); socket.text("The  mitochondria"); socket.text("The  mitochondria  is  the  powerhouse."); });
+	assert.equal(socket.sent.length, 2);
+	await act(async () => { f.dictation.stop(); });
+	assert.equal(f.dictation.phase, "stopping");
+	assert.equal(socket.sent.length, 2, "no CloseStream: the server closes once audio stops");
+	assert.deepEqual(f.state.appends, []);
+	await act(async () => { socket.text("The  mitochondria  is  the  powerhouse  of  the  cell."); socket.end(1000); });
+	assert.deepEqual(f.state.appends, ["The mitochondria is the powerhouse of the cell."]);
+	assert.equal(f.dictation.phase, "idle");
+	assert.equal(Socket.all.length, 1);
+});
+
+test("whisper stream: a mid-run drop keeps its text and the one reconnect appends after it", async () => {
+	const f = await whisperFixture("stream");
+	await act(async () => { f.dictation.toggle(); });
+	const first = Socket.all[0]!;
+	await act(async () => { first.open(); first.text("first  part"); first.end(1006); });
+	const second = Socket.all[1]!;
+	assert.ok(second, "reconnects once");
+	await act(async () => { second.open(); second.text("second  part"); });
+	await act(async () => { f.dictation.stop(); });
+	await act(async () => { second.end(1000); });
+	assert.deepEqual(f.state.appends, ["first part second part"]);
+});
+
+test("whisper stream: an unreachable server reports its URL after the one retry", async () => {
+	const f = await whisperFixture("stream");
+	await act(async () => { f.dictation.toggle(); });
+	await act(async () => { Socket.all[0]!.end(1006); });
+	await act(async () => { Socket.all[1]!.end(1006); });
+	assert.equal(Socket.all.length, 2);
+	assert.equal(f.dictation.error, "Whisper server unreachable (http://whisper.test:8000)");
+	assert.equal(f.dictation.phase, "idle");
+});
+
+test("whisper stream: Esc discards the streamed text", async () => {
+	const f = await whisperFixture("stream");
+	await act(async () => { f.dictation.toggle(); });
+	const socket = Socket.all[0]!;
+	await act(async () => { socket.open(); socket.text("discard  me"); });
+	await act(async () => { f.dictation.cancel(); });
+	assert.deepEqual(f.state.appends, []);
+	assert.equal(socket.readyState, 3);
 });

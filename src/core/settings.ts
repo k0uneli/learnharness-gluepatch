@@ -35,7 +35,10 @@ import { CLAUDE_CODE_PROVIDER } from "./contracts/claude-code.ts";
 import type { ModelRole } from "../../config.ts";
 import type { ChatSettings } from "./contracts/chat.ts";
 import { isSearchEngineId, type SearchEngineId } from "./search.ts";
-import { isDictationLanguage, type DictationLanguage } from "./dictation.ts";
+import {
+	WHISPER_DEFAULTS, isDictationEngine, isDictationLanguage, isWhisperMode, isWhisperModel, normalizeWhisperUrl,
+	type DictationEngine, type DictationLanguage, type WhisperSettings,
+} from "./dictation.ts";
 import { parseFileAccessSettings, type FileAccessSettings } from "./file-access.ts";
 
 /** The schema version this code understands. Bump ONLY for breaking shape
@@ -340,6 +343,17 @@ export interface GeneralSettings {
 /** One app-wide dictation preference, shared by every composer. */
 export interface DictationSettings {
 	language?: DictationLanguage;
+	/** Absent = Deepgram (the original engine). */
+	engine?: DictationEngine;
+	/** Self-hosted Whisper server config (only read when engine = whisper). */
+	whisper?: WhisperSettings;
+}
+
+/** Every dictation knob resolved. */
+export interface EffectiveDictation {
+	language: DictationLanguage;
+	engine: DictationEngine;
+	whisper: Required<WhisperSettings>;
 }
 
 /** Agent settings — everything about the non-conversation machinery. */
@@ -495,7 +509,7 @@ export interface UserSettings {
 export interface FactorySettings {
 	version: number;
 	general: Required<GeneralSettings>;
-	dictation: Required<DictationSettings>;
+	dictation: EffectiveDictation;
 	appearance: {
 		mode: "dark" | "light";
 		background: string | null;
@@ -515,7 +529,7 @@ export interface FactorySettings {
 export const FACTORY_SETTINGS: FactorySettings = {
 	version: CURRENT_SETTINGS_VERSION,
 	general: { autoUpdate: true },
-	dictation: { language: "en" },
+	dictation: { language: "en", engine: "deepgram", whisper: { ...WHISPER_DEFAULTS } },
 	appearance: {
 		mode: "dark",
 		background: null, // the dark default (#141414) lives in the mode's derivation curve
@@ -532,6 +546,40 @@ export const FACTORY_SETTINGS: FactorySettings = {
  *  — see its doc for the penny-batch rationale; the settings PUT names this
  *  in its rejection, the sanitizer clamps to it). */
 export const EXTRACTION_CHUNK_TOKENS_FLOOR = 500;
+
+/** Stored dictation delta → every knob resolved against the factory. */
+export function resolveDictation(stored: DictationSettings | undefined): EffectiveDictation {
+	const factory = FACTORY_SETTINGS.dictation;
+	return {
+		language: stored?.language ?? factory.language,
+		engine: stored?.engine ?? factory.engine,
+		whisper: {
+			url: stored?.whisper?.url ?? factory.whisper.url,
+			model: stored?.whisper?.model ?? factory.whisper.model,
+			mode: stored?.whisper?.mode ?? factory.whisper.mode,
+		},
+	};
+}
+
+/** Read-side dictation sanitizer: each field survives on its own merit
+ *  (an invalid field drops to the factory default, the rest stay). */
+function sanitizeDictation(raw: unknown): DictationSettings {
+	if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return {};
+	const r = raw as Record<string, unknown>;
+	const out: DictationSettings = {};
+	if (isDictationLanguage(r.language)) out.language = r.language;
+	if (isDictationEngine(r.engine)) out.engine = r.engine;
+	if (r.whisper !== null && typeof r.whisper === "object" && !Array.isArray(r.whisper)) {
+		const w = r.whisper as Record<string, unknown>;
+		const whisper: WhisperSettings = {};
+		const url = normalizeWhisperUrl(w.url);
+		if (url !== null) whisper.url = url;
+		if (isWhisperModel(w.model)) whisper.model = w.model;
+		if (isWhisperMode(w.mode)) whisper.mode = w.mode;
+		out.whisper = whisper;
+	}
+	return out;
+}
 
 // ─── Sanitizer ─────────────────────────────────────────────────────────────
 
@@ -820,13 +868,7 @@ export function sanitizeUserSettings(raw: unknown): UserSettings | null {
 	if (r.general !== null && typeof r.general === "object" && !Array.isArray(r.general)) {
 		out.general = sanitizeGeneral(r.general as Record<string, unknown>);
 	}
-	if (r.dictation !== undefined) {
-		const raw = r.dictation;
-		out.dictation = raw !== null && typeof raw === "object" && !Array.isArray(raw) &&
-			isDictationLanguage((raw as Record<string, unknown>).language)
-			? { language: (raw as DictationSettings).language }
-			: {};
-	}
+	if (r.dictation !== undefined) out.dictation = sanitizeDictation(r.dictation);
 	if (r.claudeCode !== undefined) {
 		const raw = r.claudeCode;
 		out.claudeCode = raw !== null && typeof raw === "object" && !Array.isArray(raw)

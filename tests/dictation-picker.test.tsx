@@ -43,6 +43,7 @@ async function fixture(failRead = false) {
 		failRead,
 		keys: [] as AuthKeyStatus[],
 		nextWrite: undefined as Promise<Response> | undefined,
+		bodies: [] as Record<string, unknown>[],
 	};
 	const previous = new Map<string, PropertyDescriptor | undefined>();
 	for (const [name, value] of Object.entries({
@@ -58,6 +59,7 @@ async function fixture(failRead = false) {
 			assert.equal(url, "/api/settings/dictation");
 			const body = JSON.parse(init!.body as string);
 			state.writes.push(body.language);
+			state.bodies.push(body);
 			if (state.nextWrite) { const next = state.nextWrite; state.nextWrite = undefined; return next; }
 			if (state.failWrite) return Response.json({}, { status: 500 });
 			state.record = { ...state.record, dictation: body };
@@ -226,15 +228,16 @@ for (const source of ["none", "file", "env"] as const) test(`Language is below t
 	await f.render(<KeysSection />);
 	const group = byTest("group-dictation");
 	const rows = group.lastElementChild!.children;
-	assert.equal(rows[0]!.getAttribute("data-testid"), "key-deepgram_api_key");
-	assert.equal(rows[1]!.getAttribute("data-testid"), "row-dictation-language");
-	assert.equal(rows[2]!.getAttribute("data-testid"), "dictation-setup-hint");
+	assert.equal(rows[0]!.getAttribute("data-testid"), "row-dictation-engine");
+	assert.equal(rows[1]!.getAttribute("data-testid"), "key-deepgram_api_key");
+	assert.equal(rows[2]!.getAttribute("data-testid"), "row-dictation-language");
+	assert.equal(rows[3]!.getAttribute("data-testid"), "dictation-setup-hint");
 	assert.equal(byTest("dictation-setup-hint").textContent, "Create a Deepgram API key with the Member role or higher, then add it above.");
 	assert.match(byTest("dictation-setup-hint").className, /text-muted-foreground/);
 	assert.equal(byTest("dictation-setup-hint").querySelector("a")!.href, "https://console.deepgram.com/");
 	assert.equal(byTest("dictation-setup-hint").querySelector("a")!.textContent, "Deepgram API key");
 	assert.equal(byTest("dictation-setup-hint").querySelectorAll("a").length, 1);
-	assert.match(rows[1]!.querySelector(".font-prose")!.className, /text-\(length:--lh-prose-size\)/);
+	assert.match(rows[2]!.querySelector(".font-prose")!.className, /text-\(length:--lh-prose-size\)/);
 	assert.equal(trigger().disabled, false, "language is independent of key ownership");
 	await click(byTest("key-deepgram_api_key-row"));
 	if (source !== "env") assert.ok(byTest("key-deepgram_api_key-editor"));
@@ -245,6 +248,75 @@ for (const source of ["none", "file", "env"] as const) test(`Language is below t
 	assert.equal(menu(), null);
 	assert.equal(f.state.outerEscapes, 0);
 	if (source !== "env") assert.ok(byTest("key-deepgram_api_key-editor"), "first Escape closes only the menu");
+});
+
+async function choose(select: HTMLSelectElement, value: string) {
+	await act(async () => {
+		Object.defineProperty(select, "value", { configurable: true, get: () => value });
+		select.dispatchEvent(new window.Event("change", { bubbles: true }));
+	});
+}
+async function commit(field: HTMLInputElement, value: string) {
+	await search(value, field);
+	await act(async () => { field.dispatchEvent(new window.Event("focusout", { bubbles: true })); });
+}
+const select = (id: string) => document.querySelector<HTMLSelectElement>(`[data-testid="${id}"]`)!;
+const field = (id: string) => document.querySelector<HTMLInputElement>(`[data-testid="${id}"]`)!;
+
+test("the Whisper engine swaps the Deepgram rows for Server/Model/Mode; every save keeps the rest of the section", async () => {
+	const f = await fixture();
+	f.state.keys = [{
+		id: "DEEPGRAM_API_KEY", info: AUTH_KEYS.find((key) => key.id === "DEEPGRAM_API_KEY")!,
+		present: true, masked: "…test (32 chars)", source: "file", shadowedByEnv: false,
+	}];
+	const { KeysSection } = await import("../components/settings/keys-section.tsx");
+	await f.render(<KeysSection />);
+	const rowIds = () => [...byTest("group-dictation").lastElementChild!.children].map((row) => row.getAttribute("data-testid"));
+	assert.deepEqual(rowIds(), ["row-dictation-engine", "key-deepgram_api_key", "row-dictation-language", "dictation-setup-hint"]);
+
+	await choose(select("dictation-engine"), "whisper");
+	assert.deepEqual(f.state.bodies.at(-1), { language: "en", engine: "whisper" });
+	assert.deepEqual(rowIds(), [
+		"row-dictation-engine", "row-whisper-url", "row-whisper-model", "row-whisper-mode",
+		"row-dictation-language", "dictation-setup-hint",
+	]);
+	assert.match(byTest("dictation-setup-hint").textContent!, /Whisper server/);
+	assert.equal(field("whisper-url").value, "http://localhost:8000", "generic prefilled default");
+	assert.equal(field("whisper-model").value, "Systran/faster-whisper-large-v3");
+	assert.equal(select("whisper-mode").value, "upload");
+
+	await commit(field("whisper-url"), "http://192.168.1.24:8000");
+	assert.deepEqual(f.state.bodies.at(-1), { language: "en", engine: "whisper", whisper: { url: "http://192.168.1.24:8000" } });
+	await choose(select("whisper-mode"), "stream");
+	assert.deepEqual(f.state.bodies.at(-1), {
+		language: "en", engine: "whisper", whisper: { url: "http://192.168.1.24:8000", mode: "stream" },
+	}, "a mode change carries the url");
+
+	// A language change carries the whole Whisper config with it.
+	await click(trigger());
+	await click(byTest("dictation-language-pl"));
+	assert.deepEqual(f.state.bodies.at(-1), {
+		language: "pl", engine: "whisper", whisper: { url: "http://192.168.1.24:8000", mode: "stream" },
+	});
+
+	// Live capture locks the Whisper rows like the language row.
+	await act(async () => { setDictationActive(true); });
+	assert.equal(field("whisper-url").disabled, true);
+	assert.match(byTest("row-whisper-url").className, /opacity-40/);
+	await act(async () => { setDictationActive(false); });
+
+	await choose(select("dictation-engine"), "deepgram");
+	assert.deepEqual(rowIds(), ["row-dictation-engine", "key-deepgram_api_key", "row-dictation-language", "dictation-setup-hint"]);
+	assert.deepEqual(f.state.bodies.at(-1)!.whisper, { url: "http://192.168.1.24:8000", mode: "stream" }, "switching back keeps the Whisper config");
+});
+
+test("a refused Whisper setting shows the server's reason", async () => {
+	const f = await fixture();
+	const { WhisperSettings } = await import("../components/dictation-engine.tsx");
+	await f.render(<WhisperSettings />);
+	f.state.nextWrite = Promise.resolve(Response.json({ error: "Whisper server URL must be an http(s) URL" }, { status: 400 }));
+	await commit(field("whisper-url"), "ftp://nope");
+	assert.match(byTest("whisper-settings-error").textContent!, /Could not save dictation settings: Whisper server URL must be an http\(s\) URL/);
 });
 
 test("the shared model menu preserves ranking, provider identity, keyboard clamping, and row content", async () => {

@@ -30,7 +30,10 @@ import type {
 import { BACKGROUND_MODEL_ROLES, CACHE_RETENTIONS, COMPACTION_THRESHOLD_FLOOR, CUSTOM_MODEL_PIN_FLOOR, EXTRACTION_CHUNK_TOKENS_FLOOR, MODEL_SLOTS } from "../core/settings.ts";
 import { WRITABLE_TOOL_KEYS } from "../core/pending.ts";
 import { isSearchEngineId, SEARCH_ENGINES } from "../core/search.ts";
-import { isDictationLanguage } from "../core/dictation.ts";
+import {
+	DICTATION_ENGINES, WHISPER_MODES, isDictationEngine, isDictationLanguage, isWhisperMode, isWhisperModel,
+	normalizeWhisperUrl, type WhisperSettings,
+} from "../core/dictation.ts";
 import { parseFileAccessSettings } from "../core/file-access.ts";
 
 /** Parsed-or-rejected — `ok: false` carries the 400's error message. */
@@ -407,13 +410,44 @@ export function parseCompactionSettingsBody(body: unknown): SettingsBodyResult<C
 	return { ok: true, settings };
 }
 
-/** dictation: { language?: one of Nova-3's supported language codes } */
+/** dictation: {
+ *    language?: one of Nova-3's supported language codes,
+ *    engine?: "deepgram" | "whisper",
+ *    whisper?: { url?: http(s) base URL, model?: model id, mode?: "upload" | "stream" }
+ *  } — the whole section (replace-whole); absent fields = factory defaults.
+ *  The URL is stored normalized (no trailing "/" or "/v1"). */
 export function parseDictationSettingsBody(body: unknown): SettingsBodyResult<DictationSettings> {
 	const raw = asRecord(body);
 	if (!raw) return { ok: false, error: "Invalid JSON body" };
-	if (raw.language === undefined) return { ok: true, settings: {} };
-	if (!isDictationLanguage(raw.language)) return { ok: false, error: "Unsupported dictation language" };
-	return { ok: true, settings: { language: raw.language } };
+	const settings: DictationSettings = {};
+	if (raw.language !== undefined) {
+		if (!isDictationLanguage(raw.language)) return { ok: false, error: "Unsupported dictation language" };
+		settings.language = raw.language;
+	}
+	if (raw.engine !== undefined) {
+		if (!isDictationEngine(raw.engine)) return { ok: false, error: `Unsupported dictation engine (supported: ${DICTATION_ENGINES.join(", ")})` };
+		settings.engine = raw.engine;
+	}
+	if (raw.whisper !== undefined) {
+		const w = asRecord(raw.whisper);
+		if (!w) return { ok: false, error: "whisper must be an object" };
+		const whisper: WhisperSettings = {};
+		if (w.url !== undefined) {
+			const url = normalizeWhisperUrl(w.url);
+			if (url === null) return { ok: false, error: "Whisper server URL must be an http(s) URL" };
+			whisper.url = url;
+		}
+		if (w.model !== undefined) {
+			if (!isWhisperModel(w.model)) return { ok: false, error: "Whisper model must be a model id without spaces" };
+			whisper.model = w.model;
+		}
+		if (w.mode !== undefined) {
+			if (!isWhisperMode(w.mode)) return { ok: false, error: `Unsupported Whisper mode (supported: ${WHISPER_MODES.join(", ")})` };
+			whisper.mode = w.mode;
+		}
+		settings.whisper = whisper;
+	}
+	return { ok: true, settings };
 }
 
 /** The custom endpoint's per-model pins (PATCH /api/custom-provider): the

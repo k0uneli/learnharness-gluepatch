@@ -211,6 +211,8 @@ export function CommitInput({
 	ariaLabel,
 	testid,
 	type = "text",
+	disabled,
+	className,
 }: {
 	/** "" = unset (the factory default). Mirrors the STORED record —
 	 *  after a clamped/normalized commit this flows back and the field
@@ -222,6 +224,9 @@ export function CommitInput({
 	ariaLabel: string;
 	testid?: string;
 	type?: "text" | "number";
+	disabled?: boolean;
+	/** Width override (default w-40). */
+	className?: string;
 }) {
 	// The draft exists only while editing; a blur shows the record's value
 	// again — commit-on-blur/Enter (owner ruling), the field honest about
@@ -235,6 +240,7 @@ export function CommitInput({
 			placeholder={placeholder}
 			aria-label={ariaLabel}
 			data-testid={testid}
+			disabled={disabled}
 			onChange={(e) => {
 				setEditing(true);
 				setDraft(e.target.value);
@@ -252,7 +258,11 @@ export function CommitInput({
 					e.currentTarget.blur();
 				}
 			}}
-			className="h-7 w-40 rounded-sm border border-border bg-background px-2 font-ui text-xs text-foreground outline-none placeholder:text-muted-foreground/60"
+			className={cn(
+				"h-7 w-40 rounded-sm border border-border bg-background px-2 font-ui text-xs text-foreground outline-none placeholder:text-muted-foreground/60",
+				disabled && "cursor-not-allowed",
+				className,
+			)}
 		/>
 	);
 }
